@@ -38,6 +38,7 @@
 #include <netinet/tcp.h>
 #include <openssl/sha.h>
 #include "ipvs/redirect.h"
+#include "ipvs/proxy_proto.h"
 
 static int g_defence_tcp_drop = 0;
 
@@ -157,7 +158,7 @@ inline void tcp6_send_csum(struct rte_ipv6_hdr *iph, struct tcphdr *th) {
             (void *)th - (void *)iph, IPPROTO_TCP);
 }
 
-static inline int tcp_send_csum(int af, int iphdrlen, struct tcphdr *th,
+int tcp_send_csum(int af, int iphdrlen, struct tcphdr *th,
         const struct dp_vs_conn *conn, struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     /* leverage HW TX TCP csum offload if possible */
@@ -305,7 +306,43 @@ static void tcp_in_remove_ts(struct tcphdr *tcph)
     }
 }
 
-static inline int tcp_in_add_toa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
+static int tcp_in_add_proxy_proto(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
+        struct tcphdr *tcph, int iphdrlen, int *hdr_shift)
+{
+    int offset;
+    struct proxy_info ppinfo = { 0 };
+
+    offset = iphdrlen + (tcph->doff << 2);
+    if (unlikely(EDPVS_OK != proxy_proto_parse(mbuf, offset, &ppinfo)))
+        return EDPVS_INVPKT;
+
+    if (ppinfo.datalen > 0 && ppinfo.version == conn->pp_version)
+        return EDPVS_OK;    // keep intact the orginal proxy protocol data
+
+    if (!ppinfo.datalen) {
+        ppinfo.af = tuplehash_in(conn).af;
+        ppinfo.proto = IPPROTO_TCP;
+        ppinfo.version = conn->pp_version;
+        ppinfo.cmd = 1;
+        if (AF_INET == ppinfo.af) {
+            ppinfo.addr.ip4.src_addr = conn->caddr.in.s_addr;
+            ppinfo.addr.ip4.dst_addr = conn->vaddr.in.s_addr;
+            ppinfo.addr.ip4.src_port = conn->cport;
+            ppinfo.addr.ip4.dst_port = conn->vport;
+        } else if (AF_INET6 == ppinfo.af) {
+            rte_memcpy(ppinfo.addr.ip6.src_addr, conn->caddr.in6.s6_addr, 16);
+            rte_memcpy(ppinfo.addr.ip6.dst_addr, conn->vaddr.in6.s6_addr, 16);
+            ppinfo.addr.ip6.src_port = conn->cport;
+            ppinfo.addr.ip6.dst_port = conn->vport;
+        } else {
+            return EDPVS_NOTSUPP;
+        }
+    }
+
+    return proxy_proto_insert(&ppinfo, conn, mbuf, tcph, hdr_shift);
+}
+
+static int tcp_in_add_toa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
                           struct tcphdr *tcph)
 {
     uint32_t mtu;
@@ -706,6 +743,7 @@ static int tcp_fnat_in_handler(struct dp_vs_proto *proto,
     /* af/mbuf may be changed for nat64 which in af is ipv6 and out is ipv4 */
     int af = tuplehash_out(conn).af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
+    int err, pp_hdr_shift = 0;
 
     if (mbuf_may_pull(mbuf, iphdrlen + sizeof(*th)) != 0)
         return EDPVS_INVPKT;
@@ -729,20 +767,31 @@ static int tcp_fnat_in_handler(struct dp_vs_proto *proto,
     if (th->syn && !th->ack) {
         tcp_in_remove_ts(th);
         tcp_in_init_seq(conn, mbuf, th);
-        tcp_in_add_toa(conn, mbuf, th);
+        if (PROXY_PROTOCOL_V1 != conn->pp_version &&
+                PROXY_PROTOCOL_V2 != conn->pp_version)
+            tcp_in_add_toa(conn, mbuf, th);
     }
 
-    /* add toa to first data packet */
+    /* add toa/proxy_proto to first data packet */
     if (ntohl(th->ack_seq) == conn->fnat_seq.fdata_seq
-            && !th->syn && !th->rst /*&& !th->fin*/)
-        tcp_in_add_toa(conn, mbuf, th);
+            && !th->syn && !th->rst /*&& !th->fin*/) {
+        if (PROXY_PROTOCOL_V2 == conn->pp_version ||
+                PROXY_PROTOCOL_V1 == conn->pp_version) {
+            err = tcp_in_add_proxy_proto(conn, mbuf, th, iphdrlen, &pp_hdr_shift);
+            if (unlikely(EDPVS_OK != err))
+                RTE_LOG(INFO, IPVS, "%s: insert proxy protocol fail -- %s\n",
+                        __func__, dpvs_strerror(err));
+            th = ((void *)th) + pp_hdr_shift;
+        } else {
+            tcp_in_add_toa(conn, mbuf, th);
+        }
+    }
 
     tcp_in_adjust_seq(conn, th);
 
     /* L4 translation */
     th->source  = conn->lport;
     th->dest    = conn->dport;
-
 
     return tcp_send_csum(af, iphdrlen, th, conn, mbuf, conn->in_dev);
 }
